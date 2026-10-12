@@ -1142,7 +1142,7 @@ const UI = (() => {
 
   /* ---------- Permissões do dispositivo (câmara e localização) ---------- */
   const PERM = { cam: 'unknown', camText: 'Por verificar', gps: 'unknown', gpsText: 'Por verificar', pos: null };
-  const HOSTED_URL = window.SP_HOSTED_URL || '';
+  const HOSTED_URL = window.SP_HOSTED_URL || 'https://smartponto-two.vercel.app';
   // Tipo de dispositivo: telemóvel, tablet ou desktop (toque + tamanho de ecrã + user agent)
   function detectDevice() {
     const ua = navigator.userAgent; const touch = navigator.maxTouchPoints > 1 || 'ontouchstart' in window;
