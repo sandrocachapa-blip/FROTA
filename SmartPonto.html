@@ -820,14 +820,110 @@ const UI = (() => {
 
   /* ---------- persistência ---------- */
   function save() {
+    scheduleSync();
     try { LS.setItem('sp_state', JSON.stringify(S)); }
     catch (e) { // quota: libertar as capturas mais antigas e tentar de novo
       const withCap = S.events.filter(x => x.capture); withCap.slice(Math.floor(withCap.length / 2)).forEach(x => { x.capture = null; x.captureDropped = true; });
       try { LS.setItem('sp_state', JSON.stringify(S)); toast('Espaço local cheio: capturas antigas removidas'); } catch (e2) { console.warn(e2); }
     }
   }
-  function load() { try { const raw = LS.getItem('sp_state'); if (raw) { S = JSON.parse(raw); if (S.policy.perimeterCheck === undefined) S.policy.perimeterCheck = false; return; } } catch (e) { } S = SP.seedState(); save(); }
-  function resetDemo() { if (!window.confirm('Repor todos os dados de demonstração? Os registos atuais serão apagados.')) return; LS.removeItem('sp_state'); LS.removeItem('sp_queue'); load(); toast('Dados de demonstração repostos'); closeModal(); T = null; queue = []; if (user && user.role !== 'terminal') render(); else openTerminal(); }
+  function load() { try { const raw = LS.getItem('sp_state'); if (raw) { S = JSON.parse(raw); if (S.policy.perimeterCheck === undefined) S.policy.perimeterCheck = false; S.attempts = S.attempts || {}; return; } } catch (e) { } S = SP.seedState(); save(); }
+  function resetDemo() { if (!window.confirm('Repor todos os dados de demonstração? Os registos atuais serão apagados.')) return; LS.removeItem('sp_state'); LS.removeItem('sp_queue'); LS.removeItem('sp_sync_since'); SYNC.since = ''; SYNC.snap = null; load(); toast(SYNC.key ? 'A recarregar do servidor…' : 'Dados de demonstração repostos'); closeModal(); T = null; queue = []; if (SYNC.key) syncNow(true); if (user && user.role !== 'terminal') render(); else openTerminal(); }
+
+  /* ---------- Sincronização com o servidor (https://smartponto-two.vercel.app/api/sync) ---------- */
+  const COLS = ['users', 'workers', 'locations', 'devices', 'shifts', 'corrections'];
+  const SYNC = { key: LS.getItem('sp_access_key') || '', since: LS.getItem('sp_sync_since') || '', status: 'off', text: 'Só neste dispositivo', busy: false, pending: false, snap: (() => { try { return JSON.parse(LS.getItem('sp_sync_snap')); } catch (e) { return null; } })(), timer: null, last: null };
+  const hs = v => { const t = typeof v === 'string' ? v : JSON.stringify(v); let h1 = 5381, h2 = 52711; for (let i = 0; i < t.length; i++) { const c = t.charCodeAt(i); h1 = (h1 * 33) ^ c; h2 = (h2 * 33) ^ c; } return (h1 >>> 0).toString(36) + (h2 >>> 0).toString(36); };
+  const syncUrl = () => (location.protocol.startsWith('http') && !/localhost|127\.0\.0\.1/.test(location.hostname) ? '' : 'https://smartponto-two.vercel.app') + '/api/sync';
+  function buildSnap() {
+    const sn = { events: {}, audit: {} };
+    for (const c of COLS) { sn[c] = {}; (S[c] || []).forEach(r => sn[c][r.id] = hs(r)); }
+    S.events.forEach(e => sn.events[e.event_id] = hs(e)); S.audit.forEach(a => sn.audit[a.id] = 1);
+    sn.policy = hs(S.policy); sn.holidays = hs(S.holidays); sn.blocks = hs(S.blocks); SYNC.snap = sn; try { LS.setItem('sp_sync_snap', JSON.stringify(sn)); } catch (e) { }
+  }
+  function localChanges() {
+    const sn = SYNC.snap || { events: {}, audit: {} }; const st = {}; let any = false;
+    for (const c of COLS) { const arr = (S[c] || []).filter(r => (sn[c] || {})[r.id] !== hs(r)); if (arr.length) { st[c] = arr; any = true; } }
+    if (hs(S.policy) !== sn.policy) { st.policy = S.policy; any = true; }
+    if (hs(S.holidays) !== sn.holidays) { st.holidays = S.holidays; any = true; }
+    if (hs(S.blocks) !== sn.blocks) { st.blocks = S.blocks; any = true; }
+    const au = S.audit.filter(a => !(sn.audit || {})[a.id]); if (au.length) { st.audit = au; any = true; }
+    const events = S.events.filter(e => (sn.events || {})[e.event_id] !== hs(e));
+    return { state: any ? st : null, events };
+  }
+  function applyServer(data) {
+    const sn = SYNC.snap || { events: {}, audit: {} }; const st = data.state; let changed = false;
+    if (st) {
+      for (const c of COLS) {
+        const local = new Map((S[c] || []).map(r => [r.id, r]));
+        for (const r of st[c] || []) { const cur = local.get(r.id); const localDirty = cur && (sn[c] || {})[r.id] !== hs(cur); if (localDirty) continue; if (!cur || hs(cur) !== hs(r)) { local.set(r.id, r); changed = true; if (c === 'workers') delete templateCache[r.id]; } }
+        S[c] = [...local.values()];
+      }
+      if (st.policy && hs(S.policy) === sn.policy && hs(st.policy) !== sn.policy) { S.policy = st.policy; changed = true; }
+      if (st.holidays && hs(S.holidays) === sn.holidays) S.holidays = st.holidays;
+      if (st.blocks && hs(S.blocks) === sn.blocks) S.blocks = st.blocks;
+      const am = new Map(S.audit.map(a => [a.id, a])); (st.audit || []).forEach(a => { if (!am.has(a.id)) { am.set(a.id, a); changed = true; } }); S.audit = [...am.values()].sort((a, b) => a.at < b.at ? 1 : -1).slice(0, 600);
+    }
+    const em = new Map(S.events.map(e => [e.event_id, e]));
+    for (const e of data.events || []) {
+      const cur = em.get(e.event_id);
+      if (!cur) { em.set(e.event_id, e); changed = true; continue; }
+      const localDirty = (sn.events || {})[e.event_id] !== hs(cur);
+      const srvNewer = (e.history || []).length > (cur.history || []).length;
+      if (srvNewer || !localDirty) { if (hs(cur) !== hs(e)) { em.set(e.event_id, e); changed = true; } }
+    }
+    S.events = [...em.values()].sort((a, b) => a.capturedAt < b.capturedAt ? 1 : -1);
+    return changed;
+  }
+  function setSyncStatus(status, text) { SYNC.status = status; SYNC.text = text; updSideFoot(); }
+  function scheduleSync(ms = 1500) { if (!SYNC.key) return; SYNC.pending = true; clearTimeout(SYNC.timer); SYNC.timer = setTimeout(() => syncNow(), ms); }
+  async function syncNow(first) {
+    if (!SYNC.key) return; if (SYNC.busy) { SYNC.pending = true; return; }
+    if (!navigator.onLine) { setSyncStatus('warn', 'Sem internet — guardado localmente'); return; }
+    SYNC.busy = true; SYNC.pending = false; setSyncStatus('busy', 'A sincronizar…');
+    try {
+      const H = { 'content-type': 'application/json', 'x-smartponto-key': SYNC.key };
+      if (first || !SYNC.since) {
+        // primeira ligação deste dispositivo: adota o estado do servidor; se o servidor estiver vazio, envia o estado local
+        const r = await fetch(syncUrl() + '?since=1970-01-01T00:00:00Z', { headers: H });
+        if (r.status === 401) throw Object.assign(new Error('Chave de acesso inválida'), { auth: true });
+        const d = await r.json(); if (d.error) throw new Error(d.error);
+        if (d.state) { for (const c of COLS) S[c] = d.state[c] || []; S.policy = d.state.policy || S.policy; S.holidays = d.state.holidays || []; S.blocks = d.state.blocks || {}; S.audit = d.state.audit || []; S.events = (d.events || []).sort((a, b) => a.capturedAt < b.capturedAt ? 1 : -1); Object.keys(templateCache).forEach(k => delete templateCache[k]); SYNC.since = d.serverTime; }
+        else { const r2 = await fetch(syncUrl(), { method: 'POST', headers: H, body: JSON.stringify({ since: '1970-01-01T00:00:00Z', state: S, events: S.events }) }); const d2 = await r2.json(); if (d2.error) throw new Error(d2.error); SYNC.since = d2.serverTime; }
+        buildSnap(); LS.setItem('sp_sync_since', SYNC.since); LS.setItem('sp_state', JSON.stringify(S));
+        setSyncStatus('ok', 'Sincronizado ' + SP.fmtT(SP.nowIso())); SYNC.busy = false; if (user && user.role !== 'terminal') render(); else if (T && T.step === 'scan') updSideFoot(); return;
+      }
+      const ch = localChanges();
+      const r = ch.state || ch.events.length
+        ? await fetch(syncUrl(), { method: 'POST', headers: H, body: JSON.stringify({ since: SYNC.since, state: ch.state, events: ch.events }) })
+        : await fetch(syncUrl() + '?since=' + encodeURIComponent(SYNC.since), { headers: H });
+      if (r.status === 401) throw Object.assign(new Error('Chave de acesso inválida'), { auth: true });
+      const d = await r.json(); if (d.error) throw new Error(d.error);
+      const changed = applyServer(d); SYNC.since = d.serverTime; buildSnap(); LS.setItem('sp_sync_since', SYNC.since); LS.setItem('sp_state', JSON.stringify(S));
+      setSyncStatus('ok', 'Sincronizado ' + SP.fmtT(SP.nowIso()));
+      if (changed && user && user.role !== 'terminal' && !$('#modal').classList.contains('open')) render();
+    } catch (e) { setSyncStatus(e.auth ? 'bad' : 'warn', e.auth ? 'Chave de acesso inválida' : 'Servidor indisponível — guardado localmente'); }
+    SYNC.busy = false; if (SYNC.pending) scheduleSync(800);
+  }
+  async function deriveSharedKey(accessKey) {
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(accessKey), 'PBKDF2', false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt: new TextEncoder().encode('smartponto-templates-v1'), iterations: 120000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    LS.setItem('sp_device_key', JSON.stringify(await crypto.subtle.exportKey('jwk', key))); Object.keys(templateCache).forEach(k => delete templateCache[k]);
+  }
+  function showServer() {
+    modal(`<h2>Ligação ao servidor</h2><div class="muted small mb">Com a chave de acesso, colaboradores, rostos e marcações ficam guardados em <b>smartponto-two.vercel.app</b> e partilhados por todos os dispositivos. Sem chave, os dados ficam só neste dispositivo.</div>
+    <div class="field"><label>Chave de acesso</label><input id="srvKey" value="${h(SYNC.key)}" placeholder="chave fornecida pelo administrador" autocomplete="off"></div>
+    <div class="muted small mb">Estado: ${h(SYNC.text)}</div>
+    <div class="row" style="justify-content:flex-end"><button onclick="UI.closeModal()">${SYNC.key ? 'Fechar' : 'Só neste dispositivo'}</button><button class="primary" onclick="UI.saveServer()">Ligar e sincronizar</button></div>`);
+    setTimeout(() => { const i = $('#srvKey'); if (i) i.focus(); }, 50);
+  }
+  async function saveServer() {
+    const k = ($('#srvKey').value || '').trim(); if (!k) return toast('Introduza a chave de acesso');
+    const changedKey = k !== SYNC.key; SYNC.key = k; LS.setItem('sp_access_key', k);
+    if (changedKey) { await deriveSharedKey(k); SYNC.since = ''; LS.removeItem('sp_sync_since'); }
+    closeModal(); toast('A ligar ao servidor…'); await syncNow(true);
+    if (SYNC.status === 'bad') { toast('Chave de acesso inválida', 5000); showServer(); } else toast('Ligado: ' + SYNC.text);
+  }
 
   /* ---------- sessão ---------- */
   function showLogin() {
@@ -880,7 +976,8 @@ const UI = (() => {
   const go = t => { tab = t; render(); };
   function updSideFoot() {
     const dev = T && S.devices.find(d => d.id === T.deviceId); const on = T ? isOnline() : navigator.onLine;
-    $('#sidefoot').innerHTML = `<small>ESTADO DO SISTEMA</small><strong><span class="dot ${on ? '' : 'off'}"></span> ${on ? 'Online' : 'Offline · provisório'}${queue.length ? ` · ${queue.length} na fila` : ''}</strong><small>${DEVICE_LABEL}${insecure() ? ' · <span class="warn">ficheiro local</span>' : ''} · ${dev ? h(dev.name) : 'SmartPonto'} · política ${h(S.policy.version)}</small>`;
+    const dot = SYNC.status === 'ok' ? '' : SYNC.status === 'bad' ? 'bad' : 'off';
+    $('#sidefoot').innerHTML = `<small>ESTADO DO SISTEMA</small><strong><span class="dot ${on ? '' : 'off'}"></span> ${on ? 'Online' : 'Offline · provisório'}${queue.length ? ` · ${queue.length} na fila` : ''}</strong><a href="#" onclick="UI.showServer();return false" class="small" style="display:block;margin:2px 0 6px"><span class="dot ${dot}"></span>${h(SYNC.text)}</a><small>${DEVICE_LABEL}${insecure() ? ' · <span class="warn">ficheiro local</span>' : ''} · ${dev ? h(dev.name) : 'SmartPonto'} · política ${h(S.policy.version)}</small>`;
   }
 
   /* ---------- vistas ---------- */
@@ -1699,10 +1796,12 @@ const UI = (() => {
   }
 
   /* ---------- arranque ---------- */
-  function init() { load(); openTerminal(); permBoot(); window.addEventListener('online', () => { const e = $('#tOnline'); if (e) { e.checked = true; tOnlineChange(); } }); window.addEventListener('offline', () => { const e = $('#tOnline'); if (e) { e.checked = false; tOnlineChange(); } }); }
+  function init() { load(); openTerminal(); permBoot();
+    if (SYNC.key) syncNow(!SYNC.since || !SYNC.snap); else setTimeout(showServer, 800);
+    setInterval(() => { if (SYNC.key && !SYNC.busy) syncNow(); }, 20000); window.addEventListener('online', () => syncNow()); window.addEventListener('online', () => { const e = $('#tOnline'); if (e) { e.checked = true; tOnlineChange(); } }); window.addEventListener('offline', () => { const e = $('#tOnline'); if (e) { e.checked = false; tOnlineChange(); } }); }
   document.addEventListener('DOMContentLoaded', init);
 
-  return { login, logout, go, resetDemo, filt, rfilt, showEvent, review, unblock, decideCorrection, newCorrection, saveCorrection, editWorker, saveWorker, enroll, doEnroll, unenroll, editLocation, saveLocation, editDevice, saveDevice, revoke, editShift, saveShift, addHoliday, delHoliday, savePolicy, exportExcel, exportEvents, runTests, exportTests, closeModal, closeModal2, captureFaceForForm, photoForForm, camRetry, gpsCheck: () => gpsCheck(false), registoBoot, registoSave, regMethod: regMethodSet, regGps: regGpsCheck,
+  return { login, logout, go, resetDemo, filt, rfilt, showEvent, review, unblock, decideCorrection, newCorrection, saveCorrection, editWorker, saveWorker, enroll, doEnroll, unenroll, editLocation, saveLocation, editDevice, saveDevice, revoke, editShift, saveShift, addHoliday, delHoliday, savePolicy, exportExcel, exportEvents, runTests, exportTests, closeModal, closeModal2, captureFaceForForm, photoForForm, showServer, saveServer, syncNow: () => syncNow(), camRetry, gpsCheck: () => gpsCheck(false), registoBoot, registoSave, regMethod: regMethodSet, regGps: regGpsCheck,
     showLogin, tConfirmNow, openTerminal, terminalAdminExit, tOnlineChange, tHome, tStep, tAction, tSetAction, tSearch, tSelectWorker, tIdentify, tScanQR, tMethod, tCapture, acquireGps, tSubmit, syncNow };
 })();
 
