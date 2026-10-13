@@ -28,6 +28,8 @@ function mergeState(server, client) {
 
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', 'content-type, x-smartponto-key'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.status(204).end();
   const key = req.headers['x-smartponto-key'] || '';
   if (!process.env.SMARTPONTO_KEY || key !== process.env.SMARTPONTO_KEY) return res.status(401).json({ error: 'Chave de acesso inválida' });
   if (!process.env.DATABASE_URL) return res.status(500).json({ error: 'DATABASE_URL em falta' });
